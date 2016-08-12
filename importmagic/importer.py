@@ -5,6 +5,8 @@ from collections import defaultdict
 
 from importmagic.six import StringIO
 
+LINE_FEED = '\n'
+
 
 class Iterator(object):
     def __init__(self, tokens, start=None, end=None):
@@ -65,17 +67,127 @@ class Import(object):
             or (self.alias is not None and other.alias is not None and self.alias < other.alias)
 
 
+class ImportSubBlock(object):
+
+    def __init__(self):
+        self.imports_dict = defaultdict(list)
+
+    def add_imports(self, module, import_to_add):
+        self.imports_dict[module].append(import_to_add)
+
+    def serialize(self):
+        out = StringIO()
+        modules = sorted(self.imports_dict.keys())
+        for module in modules:
+            imports = sorted(self.imports_dict[module])
+            line = 'from {module} import '.format(module=module)
+            clauses = ['{name}{alias}'.format(
+                name=i.name,
+                alias=' as {alias}'.format(alias=i.alias) if i.alias else ''
+            ) for i in imports]
+
+            if len(clauses) == 1:
+                line = line + clauses[0] + LINE_FEED
+            else:
+                clauses_lines = (',' + LINE_FEED).join([
+                    ' '*4 + clause for clause in clauses
+                ])
+                line += '(\n{},\n)\n'.format(clauses_lines)
+
+            if line.strip():
+                out.write(line)
+        return out.getvalue()
+
+    def is_empty(self):
+        return not self.imports_dict
+
+
+class ImportBlock(object):
+    def serialize(self):
+        out = StringIO()
+        out.write(
+            '\n'.join(
+                sub_block.serialize() for sub_block in self.sub_blocks if not sub_block.is_empty()
+            )
+        )
+        return out.getvalue()
+
+
+class HeaderImportBlock(ImportBlock):
+
+    def __init__(self):
+        self.libs = ImportSubBlock()
+        self.django = ImportSubBlock()
+
+    def add_import(self, main_module, import_to_add):
+        if main_module == 'django':
+            self.django.add_imports(main_module, import_to_add)
+        else:
+            self.libs.add_imports(main_module, import_to_add)
+
+    @property
+    def sub_blocks(self):
+        return [self.libs, self.django]
+
+
+class BodyImportBlock(ImportBlock):
+    associated_libs = [
+        'soa',
+        'service',
+        'eb',
+        'common',
+    ]
+
+    def __init__(self):
+        self.sub_blocks_map = defaultdict(ImportSubBlock)
+
+    def add_import(self, main_module, import_to_add):
+        self.sub_blocks_map[main_module.split('.')[0]].add_imports(main_module, import_to_add)
+
+    @property
+    def sub_blocks(self):
+        keys = self.sub_blocks_map.keys()
+        keys.sort()
+        return [self.sub_blocks_map[key] for key in keys]
+
+
+class FooterImportBlock(ImportBlock):
+
+    def __init__(self):
+        self.footer_block = ImportSubBlock()
+
+    def add_import(self, main_module, import_to_add):
+        self.footer_block.add_imports(main_module, import_to_add)
+
+    @property
+    def sub_blocks(self):
+        return [self.footer_block]
+
+
+def block_for(module):
+    if module.startswith('.'):
+        return '_footer'
+    elif any(module.startswith(eblib) for eblib in BodyImportBlock.associated_libs):
+        return '_body'
+    else:
+        return '_header'
+
+
 # See SymbolIndex.LOCATIONS for details.
 LOCATION_ORDER = 'FS3L'
 
 
 class Imports(object):
 
-    _style = {'multiline': 'parentheses',
-              'max_columns': 80,
+    _style = {
+        'multiline': 'parentheses',
+        'max_columns': 120,
     }
 
     def __init__(self, index, source):
+        self._header = HeaderImportBlock()
+        self._body = BodyImportBlock()
+        self._footer = FooterImportBlock()
         self._imports = set()
         self._imports_from = defaultdict(set)
         self._imports_begin = self._imports_end = None
@@ -87,13 +199,15 @@ class Imports(object):
     def set_style(cls, **kwargs):
         cls._style.update(kwargs)
 
-    def add_import(self, name, alias=None):
+    def add_import(self, module, name, alias=None):
         location = LOCATION_ORDER.index(self._index.location_for(name))
         self._imports.add(Import(location, name, alias))
 
     def add_import_from(self, module, name, alias=None):
         location = LOCATION_ORDER.index(self._index.location_for(module))
-        self._imports_from[module].add(Import(location, name, alias))
+        location_new = block_for(module)
+        getattr(self, location_new).add_import(module, Import(location, name, alias))
+        # self._imports_from[module].add(Import(location, name, alias))
 
     def remove(self, references):
         for imp in list(self._imports):
@@ -105,65 +219,66 @@ class Imports(object):
                     imports.remove(imp)
 
     def get_update(self):
-        groups = []
-        for expected_location in range(len(LOCATION_ORDER)):
-            out = StringIO()
-            for imp in sorted(self._imports):
-                if expected_location != imp.location:
-                    continue
-                out.write('import {module}{alias}\n'.format(
-                    module=imp.name,
-                    alias=' as {alias}'.format(alias=imp.alias) if imp.alias else '',
-                ))
+        out = StringIO()
+        out.write(
+            '\n'.join(
+                block.serialize() for block in (self._header, self._body, self._footer,)
+            )
+        )
+        out.write('\n')
+        text = out.getvalue()
 
-            for module, imports in sorted(self._imports_from.items()):
-                imports = sorted(imports)
-                if not imports or expected_location != imports[0].location:
-                    continue
-                line = 'from {module} import '.format(module=module)
-                clauses = ['{name}{alias}'.format(
-                           name=i.name,
-                           alias=' as {alias}'.format(alias=i.alias) if i.alias else ''
-                           ) for i in imports]
-                clauses.reverse()
-                line_len = len(line)
-                line_pieces = []
-                paren_used = False
-                while clauses:
-                    clause = clauses.pop()
-                    next_len = line_len + len(clause) + 2
-                    if next_len > self._style['max_columns']:
-                        imported_items = ', '.join(line_pieces)
-                        if self._style['multiline'] == 'parentheses':
-                            line_tail = ',\n'
-                            if not paren_used:
-                                line += '('
-                                paren_used = True
-                            line_pieces.append('\n')
-                        else:
-                            # Use a backslash
-                            line_tail = ', \\\n'
-                        out.write(line + imported_items + line_tail)
-                        line = '    '
-                        line_len = len(line) + len(clause) + 2
-                        line_pieces = [clause]
-                    else:
-                        line_pieces.append(clause)
-                        line_len = next_len
-                line += ', '.join(line_pieces) + (')\n' if paren_used else '\n')
-                if line.strip():
-                    out.write(line)
+        # for expected_location in range(len(LOCATION_ORDER)):
+        #     out = StringIO()
+        #     for imp in sorted(self._imports):
+        #         if expected_location != imp.location:
+        #             continue
+        #         out.write('import {module}{alias}\n'.format(
+        #             module=imp.name,
+        #             alias=' as {alias}'.format(alias=imp.alias) if imp.alias else '',
+        #         ))
+            # modules_dict = dict(sorted(self._imports_from.items()))
 
-            text = out.getvalue()
-            if text:
-                groups.append(text)
+            # for module in modules_dict.keys():
+            #     imports = modules_dict.get(module)
+            #     imports = sorted(imports)
+            #     if not imports or expected_location != imports[0].location:
+            #         continue
+            #     line = 'from {module} import '.format(module=module)
+            #     clauses = ['{name}{alias}'.format(
+            #                name=i.name,
+            #                alias=' as {alias}'.format(alias=i.alias) if i.alias else ''
+            #                ) for i in imports]
+            #     clauses.reverse()
+            #     line_pieces = []
+            #     paren_used = False
+            #     while clauses:
+            #         clause = clauses.pop()
+            #         # next_len = line_len + len(clause) + 2
+            #         # if next_len > self._style['max_columns']:
+            #         imported_items = ', '.join(line_pieces)
+            #         if not paren_used:
+            #             line += '('
+            #             paren_used = True
+            #             line_tail = '\n'
+            #         else:
+            #             line_tail = ',\n'
+            #         line_pieces.append('\n')
 
+            #         out.write(line + imported_items + line_tail)
+            #         line = '    '
+            #         line_pieces = [clause]
+            #     line += ', '.join(line_pieces) + (',\n)\n' if paren_used else '\n')
+            #     if line.strip():
+            #         out.write(line)
+            #     out.write('\n')
+
+            # text = out.getvalue()
+            # if text:
+            #     groups.append(text)
         start = self._tokens[self._imports_begin][2][0] - 1
         end = self._tokens[min(len(self._tokens) - 1, self._imports_end)][2][0] - 1
-        if groups:
-            text = '\n'.join(groups) + '\n\n'
-        else:
-            text = ''
+
         return start, end, text
 
     def update_source(self):
@@ -304,7 +419,7 @@ class Imports(object):
             if next == ',':
                 pass
             if type == 'import':
-                self.add_import(name, alias=alias)
+                self.add_import(module, name, alias=alias)
             else:
                 self.add_import_from(module, name, alias=alias)
 
