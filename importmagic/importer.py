@@ -1,11 +1,14 @@
 """Imports new symbols."""
-
+import itertools
 import tokenize
 from collections import defaultdict
 
 from importmagic.six import StringIO
 
 LINE_FEED = '\n'
+IMPORT_TYPE_FROM = 'from'
+IMPORT_TYPE_IMPORT = 'import'
+IMPORT_TYPES = frozenset([IMPORT_TYPE_FROM, IMPORT_TYPE_IMPORT])
 
 
 class Iterator(object):
@@ -43,10 +46,11 @@ class Iterator(object):
 
 
 class Import(object):
-    def __init__(self, location, name, alias):
+    def __init__(self, location, name, alias, import_type):
         self.location = location
         self.name = name
         self.alias = alias
+        self.import_type = import_type
 
     def __repr__(self):
         return 'Import(location=%r, name=%r, alias=%r)' % \
@@ -80,11 +84,19 @@ class ImportSubBlock(object):
         modules = sorted(self.imports_dict.keys())
         for module in modules:
             imports = sorted(self.imports_dict[module])
-            line = 'from {module} import '.format(module=module)
-            clauses = ['{name}{alias}'.format(
-                name=i.name,
-                alias=' as {alias}'.format(alias=i.alias) if i.alias else ''
-            ) for i in imports]
+            if len(imports) == 1 and imports[0].import_type == IMPORT_TYPE_IMPORT:
+                imp = imports[0]
+                line = 'import {module}{alias}'.format(
+                    module=module,
+                    alias=' as {alias}'.format(alias=imp.alias) if imp.alias else ''
+                )
+                clauses = ['']
+            else:
+                line = 'from {module} import '.format(module=module)
+                clauses = ['{name}{alias}'.format(
+                    name=i.name,
+                    alias=' as {alias}'.format(alias=i.alias) if i.alias else ''
+                ) for i in imports]
 
             if len(clauses) == 1:
                 line = line + clauses[0] + LINE_FEED
@@ -199,15 +211,20 @@ class Imports(object):
     def set_style(cls, **kwargs):
         cls._style.update(kwargs)
 
-    def add_import(self, module, name, alias=None):
+    @property
+    def all_imports(self):
+        return itertools.chain(self._header, self._body, self._footer)
+
+    def add_import(self, name, alias=None):
         location = LOCATION_ORDER.index(self._index.location_for(name))
-        self._imports.add(Import(location, name, alias))
+        location_new = block_for(name)
+
+        getattr(self, location_new).add_import(name, Import(location, name, alias, IMPORT_TYPE_IMPORT))
 
     def add_import_from(self, module, name, alias=None):
         location = LOCATION_ORDER.index(self._index.location_for(module))
         location_new = block_for(module)
-        getattr(self, location_new).add_import(module, Import(location, name, alias))
-        # self._imports_from[module].add(Import(location, name, alias))
+        getattr(self, location_new).add_import(module, Import(location, name, alias, IMPORT_TYPE_FROM))
 
     def remove(self, references):
         for imp in list(self._imports):
@@ -227,55 +244,6 @@ class Imports(object):
         )
         out.write('\n')
         text = out.getvalue()
-
-        # for expected_location in range(len(LOCATION_ORDER)):
-        #     out = StringIO()
-        #     for imp in sorted(self._imports):
-        #         if expected_location != imp.location:
-        #             continue
-        #         out.write('import {module}{alias}\n'.format(
-        #             module=imp.name,
-        #             alias=' as {alias}'.format(alias=imp.alias) if imp.alias else '',
-        #         ))
-            # modules_dict = dict(sorted(self._imports_from.items()))
-
-            # for module in modules_dict.keys():
-            #     imports = modules_dict.get(module)
-            #     imports = sorted(imports)
-            #     if not imports or expected_location != imports[0].location:
-            #         continue
-            #     line = 'from {module} import '.format(module=module)
-            #     clauses = ['{name}{alias}'.format(
-            #                name=i.name,
-            #                alias=' as {alias}'.format(alias=i.alias) if i.alias else ''
-            #                ) for i in imports]
-            #     clauses.reverse()
-            #     line_pieces = []
-            #     paren_used = False
-            #     while clauses:
-            #         clause = clauses.pop()
-            #         # next_len = line_len + len(clause) + 2
-            #         # if next_len > self._style['max_columns']:
-            #         imported_items = ', '.join(line_pieces)
-            #         if not paren_used:
-            #             line += '('
-            #             paren_used = True
-            #             line_tail = '\n'
-            #         else:
-            #             line_tail = ',\n'
-            #         line_pieces.append('\n')
-
-            #         out.write(line + imported_items + line_tail)
-            #         line = '    '
-            #         line_pieces = [clause]
-            #     line += ', '.join(line_pieces) + (',\n)\n' if paren_used else '\n')
-            #     if line.strip():
-            #         out.write(line)
-            #     out.write('\n')
-
-            # text = out.getvalue()
-            # if text:
-            #     groups.append(text)
         start = self._tokens[self._imports_begin][2][0] - 1
         end = self._tokens[min(len(self._tokens) - 1, self._imports_end)][2][0] - 1
 
@@ -350,7 +318,7 @@ class Imports(object):
                 ranges.append((0, index, index))
 
             # Accumulate imports
-            if token[1] in ('import', 'from'):
+            if token[1] in IMPORT_TYPES:
                 potential_end_index = -1
                 if start is None:
                     start = index
@@ -382,11 +350,11 @@ class Imports(object):
         while it:
             index, token = it.next()
 
-            if token[1] not in ('import', 'from') and token[1].strip():
+            if token[1] not in IMPORT_TYPES and token[1].strip():
                 continue
 
             type = token[1]
-            if type in ('import', 'from'):
+            if type in IMPORT_TYPES:
                 tokens = it.until(tokenize.NEWLINE)
                 tokens = [t[1] for i, t in tokens
                           if t[0] == tokenize.NAME or t[1] in ',.']
@@ -395,11 +363,12 @@ class Imports(object):
 
     def _parse_import(self, type, tokens):
         module = None
-        if type == 'from':
+        if type == IMPORT_TYPE_FROM:
             module = ''
             while tokens and tokens[-1] != 'import':
                 module += tokens.pop()
             assert tokens.pop() == 'import'
+
         while tokens:
             name = ''
             while True:
@@ -418,8 +387,8 @@ class Imports(object):
                 next = tokens.pop() if tokens else None
             if next == ',':
                 pass
-            if type == 'import':
-                self.add_import(module, name, alias=alias)
+            if type == IMPORT_TYPE_IMPORT:
+                self.add_import(name, alias=alias)
             else:
                 self.add_import_from(module, name, alias=alias)
 
