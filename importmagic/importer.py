@@ -1,4 +1,5 @@
 """Imports new symbols."""
+import re
 import itertools
 import tokenize
 from collections import defaultdict
@@ -132,7 +133,7 @@ class HeaderImportBlock(ImportBlock):
         self.django = ImportSubBlock()
 
     def add_import(self, main_module, import_to_add):
-        if main_module == 'django':
+        if main_module.startswith('django'):
             self.django.add_imports(main_module, import_to_add)
         else:
             self.libs.add_imports(main_module, import_to_add)
@@ -143,11 +144,13 @@ class HeaderImportBlock(ImportBlock):
 
 
 class BodyImportBlock(ImportBlock):
-    associated_libs = [
+    associated_libs_regexs = [
         'soa',
         'service',
         'eb',
         'common',
+        'eb_constants',
+        'permissions',
     ]
 
     def __init__(self):
@@ -165,6 +168,10 @@ class BodyImportBlock(ImportBlock):
 
 class FooterImportBlock(ImportBlock):
 
+    associated_libs_regexs = [
+        '_service\.',
+    ]
+
     def __init__(self):
         self.footer_block = ImportSubBlock()
 
@@ -177,9 +184,12 @@ class FooterImportBlock(ImportBlock):
 
 
 def block_for(module):
-    if module.startswith('.'):
+    if (
+        module.startswith('.') or
+        any(re.search(eblib_regex, module) for eblib_regex in FooterImportBlock.associated_libs_regexs)
+    ):
         return '_footer'
-    elif any(module.startswith(eblib) for eblib in BodyImportBlock.associated_libs):
+    elif any(re.search(eblib_regex, module) for eblib_regex in BodyImportBlock.associated_libs_regexs):
         return '_body'
     else:
         return '_header'
@@ -240,9 +250,9 @@ class Imports(object):
         out.write(
             '\n'.join(
                 block.serialize() for block in (self._header, self._body, self._footer,)
-            )
+            ).strip()
         )
-        out.write('\n')
+        out.write('\n\n\n')
         text = out.getvalue()
         start = self._tokens[self._imports_begin][2][0] - 1
         end = self._tokens[min(len(self._tokens) - 1, self._imports_end)][2][0] - 1
@@ -253,7 +263,8 @@ class Imports(object):
         start, end, text = self.get_update()
         lines = self._source.splitlines()
         lines[start:end] = text.splitlines()
-        return '\n'.join(lines) + '\n'
+
+        return '\n'.join(lines)
 
     def _parse(self, source):
         reader = StringIO(source)
